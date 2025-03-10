@@ -1,0 +1,91 @@
+After fixing the cori/perlmutter error, I get this
+
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/code/desiutil/main/py/desiutil/redirect.py", line 206, in stdouterr_redirected
+    yield  # Allow code to be run with the redirected output
+  File "/pscratch/sd/f/forero/dither_DESI/./fba_cmx_new", line 1519, in <module>
+    main()
+  File "/pscratch/sd/f/forero/dither_DESI/./fba_cmx_new", line 824, in main
+    run_assign_full(ag)
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/code/fiberassign/main/py/fiberassign/scripts/assign.py", line 385, in run_assign_full
+    hw, tiles, tgs, tagalong = run_assign_init(args, plate_radec=plate_radec)
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/code/fiberassign/main/py/fiberassign/scripts/assign.py", line 342, in run_assign_init
+    load_target_file(tgs, tagalong, tgfile, typeforce=typeforce,
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/code/fiberassign/main/py/fiberassign/targets.py", line 1183, in load_target_file
+    load_target_table(tgs, tagalong, data, survey=survey,
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/code/fiberassign/main/py/fiberassign/targets.py", line 1111, in load_target_table
+    append_target_table(tgs, tagalong, tgdata, survey, typeforce, typecol, sciencemask,
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/code/fiberassign/main/py/fiberassign/targets.py", line 859, in append_target_table
+    d_type[:] = desi_target_type(
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/code/fiberassign/main/py/fiberassign/targets.py", line 656, in desi_target_type
+    ttype[mws_target  & gaia_stdmask != 0] |= TARGET_TYPE_STANDARD
+TypeError: unsupported operand type(s) for &: 'int' and 'NoneType'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/pscratch/sd/f/forero/dither_DESI/./fba_cmx_new", line 1518, in <module>
+    with stdouterr_redirected(to=logfn):
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/conda/lib/python3.10/contextlib.py", line 153, in __exit__
+    self.gen.throw(typ, value, traceback)
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/code/desiutil/main/py/desiutil/redirect.py", line 250, in stdouterr_redirected
+    raise RuntimeError(msg)
+RuntimeError: 1 processes raised an exception while logs were redirected
+
+To fix that
+
+#Added this in line 819 to specify the gaia_stdmask parameter. 
+            opts.append("--gaia_stdmask")
+            if "STD_DITHER_GAIA" in cmx_mask.names():
+                opts.append(str(cmx_mask["STD_DITHER_GAIA"].mask))
+            else:
+            # Default to zero or another appropriate value if the mask isn't found
+            opts.append("0")
+
+
+Then a new error appears
+
+Traceback (most recent call last):
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/code/desiutil/main/py/desiutil/redirect.py", line 206, in stdouterr_redirected
+    yield  # Allow code to be run with the redirected output
+  File "/pscratch/sd/f/forero/dither_DESI/./fba_cmx_new", line 1528, in <module>
+    main()
+  File "/pscratch/sd/f/forero/dither_DESI/./fba_cmx_new", line 832, in main
+    ag = parse_assign(opts)
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/code/fiberassign/main/py/fiberassign/scripts/assign.py", line 223, in parse_assign
+    mws_mask = filemasks[2]
+IndexError: list index out of range
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/pscratch/sd/f/forero/dither_DESI/./fba_cmx_new", line 1527, in <module>
+    with stdouterr_redirected(to=logfn):
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/conda/lib/python3.10/contextlib.py", line 153, in __exit__
+    self.gen.throw(typ, value, traceback)
+  File "/global/common/software/desi/perlmutter/desiconda/20240425-2.2.0/code/desiutil/main/py/desiutil/redirect.py", line 250, in stdouterr_redirected
+    raise RuntimeError(msg)
+RuntimeError: 1 processes raised an exception while logs were redirected
+
+To fix that I added in line 336
+
+    # Monkey patch the main_cmx_or_sv function to handle CMX files properly
+    import types
+    from desitarget.targets import main_cmx_or_sv
+
+    # Save the original function
+    original_main_cmx_or_sv = main_cmx_or_sv
+
+    # Create a patched version that ensures filemasks has at least 3 elements for CMX
+    def patched_main_cmx_or_sv(*args, **kwargs):
+        filecols, filemasks, filesurvey = original_main_cmx_or_sv(*args, **kwargs)
+        if filesurvey == 'cmx' and len(filemasks) < 3:
+            # Add missing masks to ensure filemasks[2] exists
+            from desitarget.cmx.cmx_targetmask import cmx_mask
+            while len(filemasks) < 3:
+                filemasks.append(cmx_mask)
+        return filecols, filemasks, filesurvey
+
+    # Apply the patch
+    import desitarget.targets
+    desitarget.targets.main_cmx_or_sv = patched_main_cmx_or_sv
+    # original code starts here...
