@@ -49,7 +49,7 @@ selects dither standards in this order:
    returns 0 targets, automatically fall back to step 2. Sets
    `tile_in_desi = 0` so fiberassign receives the correct `gaia_stdmask`.
    This happens when a catalog version covers only a partial footprint
-   (e.g., dtver 1.0.0 covers only RA≈27–67°, Dec≈1–29°).
+   
 
 ## Key differences from `fba_cmx_new`
 
