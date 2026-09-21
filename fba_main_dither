@@ -120,7 +120,7 @@ def unq_searchsorted(A, B):
     # AR sorting A,B
     tmpA = np.sort(A)
     tmpB = np.sort(B)
-    # AR create mask equivalent to np.in1d(A,B) and np.in1d(B,A) for unique elements
+    # AR create mask equivalent to np.isin(A,B) and np.isin(B,A) for unique elements
     maskA = (
         np.searchsorted(tmpB, tmpA, "right") - np.searchsorted(tmpB, tmpA, "left")
     ) == 1
@@ -418,6 +418,21 @@ def main():
         dmio.load_tiles(), args.tilera, args.tiledec
     ).astype(int)
 
+    # AR do we take the dither standards from the (dense) Gaia backup catalog?
+    # AR main-survey STD_FAINT only yields ~450-850 stars/tile, so fiberassign can
+    # AR fill only ~300-950 of the 5000 fibres and the rest go to sky.  The Gaia
+    # AR backup catalog GAIA_STD_FAINT yields ~1300-3100 stars/tile, which is the
+    # AR main-survey analogue of the CMX STD_DITHER selection.
+    is_dither = args.faflavor in ["dithprec", "dithlost", "dithfocus"]
+    if not is_dither:
+        use_gaia_std = False
+    elif args.stdsource == "gaia":
+        use_gaia_std = True
+    elif args.stdsource == "desi":
+        use_gaia_std = False
+    else:
+        use_gaia_std = tile_in_desi == 0
+
     if (not tile_in_desi) and (args.faflavor in ["scidark", "scibright"]):
         log.error(
             "requested tile is not in DESI and requested faflavor=={}; exiting".format(
@@ -448,7 +463,7 @@ def main():
 
     # AR flavor settings
     if args.faflavor == "dithprec":
-        if tile_in_desi == 0:
+        if use_gaia_std:
             fdict["msks"] = "GAIA_STD_FAINT"
         else:
             fdict["msks"] = "STD_FAINT"
@@ -457,7 +472,7 @@ def main():
         fdict["gfrac"] = 1.0
         fdict["gwidth"] = 0.7
     elif args.faflavor == "dithlost":
-        if tile_in_desi == 0:
+        if use_gaia_std:
             fdict["msks"] = "GAIA_STD_FAINT"
         else:
             fdict["msks"] = "STD_FAINT"
@@ -473,7 +488,7 @@ def main():
         fdict["obscon"] = "BRIGHT"
         fdict["msks"] = "BGS_BRIGHT,BGS_FAINT"
     elif args.faflavor == "dithfocus":
-        if tile_in_desi == 0:
+        if use_gaia_std:
             fdict["msks"] = "GAIA_STD_FAINT"
         else:
             fdict["msks"] = "STD_FAINT"
@@ -496,7 +511,7 @@ def main():
         )
 
     mydirs = {}
-    if (args.faflavor in ["dithprec", "dithlost", "dithfocus"]) & (tile_in_desi == 0):
+    if use_gaia_std:
         # AR off-footprint dither targets: dtver<=0.x used "supp", dtver>=1.0 uses "backup"
         _supp = os.path.join(path_to_targets, "gaiadr2", args.dtver, "targets/main/resolve/supp")
         _backup = os.path.join(path_to_targets, "gaiadr2", args.dtver, "targets/main/resolve/backup")
@@ -547,7 +562,7 @@ def main():
     ]
 
     new_fns = ["fiberassign-{:06d}.fits".format(tid) for tid in tileids]
-    if np.in1d(new_fns, prev_fns).sum() > 0:
+    if np.isin(new_fns, prev_fns).sum() > 0:
         log.error(
             "{:.1f}s\tsome of {} files already exist; exiting".format(
                 time() - start, ",".join(new_fns)
@@ -748,7 +763,8 @@ def main():
                 )
                 sys.exit()
             fdict["msks"] = "GAIA_STD_FAINT"
-            tile_in_desi = 0  # AR propagates to gaia_stdmask selection in dofa
+            tile_in_desi = 0  # AR propagates to the plotting branch below
+            use_gaia_std = True  # AR propagates to gaia_stdmask selection in dofa
             log.info("{:.1f}s\tGaia fallback targ dir: {}".format(time() - start, mydirs["targ"]))
             d, hdr = read_targets_in_tiles(mydirs["targ"], tiles=tiles, quick=True, header=True)
             keep = np.zeros(len(d), dtype=bool)
@@ -891,7 +907,7 @@ def main():
             # AR gaia_stdmask: MWS_TARGET bit for Gaia standards on off-footprint tiles
             # AR (in-footprint tiles use DESI_TARGET STD_FAINT, so gaia_stdmask=0)
             opts.append("--gaia_stdmask")
-            if tile_in_desi == 0:
+            if use_gaia_std:
                 if fdict["obscon"] == "BRIGHT":
                     opts.append(str(mws_mask["GAIA_STD_BRIGHT"].mask))
                 else:
@@ -1063,7 +1079,7 @@ def main():
                 h = fits.open(root + "-targ.fits")
                 ras, decs = h[1].data["RA"], h[1].data["DEC"]
                 # AR targets to be offset
-                inds = np.where(np.in1d(h[1].data["TARGETID"], tids))[
+                inds = np.where(np.isin(h[1].data["TARGETID"], tids))[
                     0
                 ]  # AR indexes of assigned targets
                 if fdict["gfrac"] > 0:  # AR targets to be offset by a Gaussian
@@ -1074,7 +1090,7 @@ def main():
                     ginds = []
                 # AR targets to be offset within a box (dithlost-in-space)
                 tmpinds = inds[
-                    ~np.in1d(inds, ginds)
+                    ~np.isin(inds, ginds)
                 ]  # AR targets not offset by a Gaussian
                 if fdict["bfrac"] > 0:
                     if fdict["gfrac"] + fdict["bfrac"] == 1:
@@ -1213,7 +1229,7 @@ def main():
             for ip, key in enumerate(["FLUX_G", "FLUX_R", "FLUX_Z"]):
                 ax = plt.subplot(gs[0, ip])
                 # AR handling outside desi cases
-                if tile_in_desi == 1:
+                if (tile_in_desi == 1) and (not use_gaia_std):
                     keep = dp[key] > 0
                     xp = 22.5 - 2.5 * np.log10(dp[key][keep])
                     bitp = dp[plot_targ_col][keep]
@@ -1577,6 +1593,15 @@ if __name__ == "__main__":
         metavar="DOCLEAN",
     )
 
+    parser.add_argument(
+        "--stdsource",
+        help="source of dither standards: gaia=always use the Gaia backup catalog GAIA_STD_FAINT (dense, ~2500-3000/tile); desi=always use main-survey DESI_TARGET STD_FAINT (sparse, ~500/tile); auto=STD_FAINT in-footprint, Gaia off-footprint (pre-2026-09 behaviour) (default=gaia)",
+        type=str,
+        default="gaia",
+        choices=["gaia", "desi", "auto"],
+        required=False,
+        metavar="STDSOURCE",
+    )
     parser.add_argument(
         "--pmtime",
         help="yyyy-mm-ddThh:mm:ss, time use to compute new coordinates after applying proper motion since REF_EPOCH (default=midnight of Time.now())",
