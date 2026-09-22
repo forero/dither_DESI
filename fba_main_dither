@@ -412,6 +412,24 @@ def main():
         log.error("code needs to be run either on NERSC/cori, NERSC/perlmutter or KPNO/desi; exiting")
         sys.exit()
 
+    # AR safe: environment.  desitarget.io.write_mtl does int() on a size-1,
+    # AR ndim-1 array (np.unique(release // 1000)).  numpy deprecated that in
+    # AR 1.25 and raises TypeError from 2.4 on, which write_mtl catches and
+    # AR re-raises as the misleading "Multiple data releases in MTL ([9])" --
+    # AR [9] being a single release.  Probe the exact failing expression rather
+    # AR than sniffing versions, and fail here with something actionable
+    # AR instead of a traceback 800 lines into the run.
+    try:
+        _ = int(np.unique(np.array([9000]) // 1000))
+    except TypeError:
+        log.error(
+            "this numpy ({}) breaks desitarget.io.write_mtl; the run would fail later "
+            "with the misleading 'Multiple data releases in MTL'.  Use the pinned "
+            "environment:  source /global/common/software/desi/desi_environment.sh 26.3 "
+            "; exiting".format(np.__version__)
+        )
+        sys.exit(1)  # AR nonzero so driver scripts running under `set -e` stop here
+
     # AR is tile in the desi footprint?
     # AR -> if not, special msk and targdir for dithering
     tile_in_desi = is_point_in_desi(
