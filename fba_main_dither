@@ -444,7 +444,7 @@ def main():
     is_dither = args.faflavor in ["dithprec", "dithlost", "dithfocus"]
     if not is_dither:
         use_gaia_std = False
-    elif args.stdsource == "gaia":
+    elif args.stdsource in ("gaia", "gaia+backup"):
         use_gaia_std = True
     elif args.stdsource == "desi":
         use_gaia_std = False
@@ -479,21 +479,26 @@ def main():
         "bwidth"
     ] = 0.0  # AR box width [arcsec] of the dithering for the dithlost-in-space case
 
+    # AR which target bits the dithering flavors select.  BACKUP_* are plain
+    # AR Gaia stars with no colour cuts, which is what the CMX STD_DITHER mask
+    # AR actually was (gaiagmag >= 11.5, no colour or faint limit); GAIA_STD_FAINT
+    # AR alone is the sparser spectrophotometric-standard selection.
+    if args.stdsource == "gaia+backup":
+        dither_msks = "GAIA_STD_FAINT,BACKUP_FAINT,BACKUP_VERY_FAINT"
+    elif use_gaia_std:
+        dither_msks = "GAIA_STD_FAINT"
+    else:
+        dither_msks = "STD_FAINT"
+
     # AR flavor settings
     if args.faflavor == "dithprec":
-        if use_gaia_std:
-            fdict["msks"] = "GAIA_STD_FAINT"
-        else:
-            fdict["msks"] = "STD_FAINT"
+        fdict["msks"] = dither_msks
         fdict["seed"] = args.seed
         fdict["ndither"] = 12
         fdict["gfrac"] = 1.0
         fdict["gwidth"] = 0.7
     elif args.faflavor == "dithlost":
-        if use_gaia_std:
-            fdict["msks"] = "GAIA_STD_FAINT"
-        else:
-            fdict["msks"] = "STD_FAINT"
+        fdict["msks"] = dither_msks
         fdict["seed"] = args.seed
         fdict["ndither"] = 2
         fdict["gfrac"] = 0.5
@@ -506,14 +511,22 @@ def main():
         fdict["obscon"] = "BRIGHT"
         fdict["msks"] = "BGS_BRIGHT,BGS_FAINT"
     elif args.faflavor == "dithfocus":
-        if use_gaia_std:
-            fdict["msks"] = "GAIA_STD_FAINT"
-        else:
-            fdict["msks"] = "STD_FAINT"
+        fdict["msks"] = dither_msks
         fdict["seed"] = args.seed
         fdict["ndither"] = 12
         fdict["gfrac"] = 1.0
         fdict["gwidth"] = 2.0
+    # AR BACKUP_* targets carry OBSCONDITIONS=BACKUP only (no DARK, no GRAY,
+    # AR no BRIGHT), so a DARK|GRAY tile excludes them and selecting the bits
+    # AR alone changes nothing.  Widening the tile obscon is what makes them
+    # AR assignable; the two must move together, hence one option for both.
+    if (args.stdsource == "gaia+backup") and is_dither:
+        fdict["obscon"] = "{}|BACKUP".format(fdict["obscon"])
+        log.info(
+            "{:.1f}s\tstdsource=gaia+backup: msks={} , tile obscon widened to {}".format(
+                time() - start, fdict["msks"], fdict["obscon"]
+            )
+        )
     if fdict["seed"] != -1:
         np.random.seed(fdict["seed"])
 
@@ -807,6 +820,27 @@ def main():
                     )
                 )
                 sys.exit()
+        # AR gaia+backup: the BACKUP_* stars are astrometrically a little worse
+        # AR than the true standards (at 46 +2, AEN<1 in 0.91-0.97 of them and a
+        # AR full 5-parameter solution in 0.98-0.99, against 1.00/1.00 for
+        # AR GAIA_STD_FAINT).  Dithering measures sub-arcsec centroid offsets, so
+        # AR hold them to the same astrometric cuts CMX used for STD_DITHER_GAIA.
+        # AR The true standards are exempt: they pass these anyway in the fields
+        # AR measured, and a sparse field must not lose them to a catalog quirk.
+        if (args.stdsource == "gaia+backup") and is_dither:
+            isstd = target_mask_filter(d, "GAIA_STD_FAINT")
+            isgoodastrom = (d["GAIA_ASTROMETRIC_EXCESS_NOISE"] < 1.0) & (
+                d["GAIA_ASTROMETRIC_PARAMS_SOLVED"] == 31
+            )
+            nbefore = len(d)
+            d = d[isstd | isgoodastrom]
+            log.info(
+                "{:.1f}s\tastrometric cut (AEN<1 & 5-param) on non-standard dither targets: "
+                "{} -> {} targets ({} standards exempt)".format(
+                    time() - start, nbefore, len(d), int(isstd.sum())
+                )
+            )
+
         # AR DITHER : tweaking PRIORITY and NUMOBS_MORE + updating the header
         if args.faflavor in ["dithprec", "dithlost", "dithfocus"]:
             d["PRIORITY_INIT"] = 1210 - np.clip(
@@ -818,6 +852,19 @@ def main():
                     time() - start
                 )
             )
+            # AR with gaia+backup the BACKUP_* stars outnumber the true flux
+            # AR standards ~6:1 and, ranked on Rp alone, crowd them off the
+            # AR focal plane.  Lift the standards clear of the whole Rp-based
+            # AR range (1000-1110) so they are assigned first and the BACKUP
+            # AR stars only fill what is left.
+            if args.stdsource == "gaia+backup":
+                isstd = target_mask_filter(d, "GAIA_STD_FAINT")
+                d["PRIORITY_INIT"][isstd] += 200
+                log.info(
+                    "{:.1f}s\tboosted PRIORITY_INIT by 200 for {} GAIA_STD_FAINT of {} dither targets".format(
+                        time() - start, isstd.sum(), len(d)
+                    )
+                )
         # AR custom mtl
         _ = main_make_mtl(d, "{}-targ.fits".format(root), tmpoutdir)
         # AR DITHER: update header
@@ -1613,10 +1660,10 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--stdsource",
-        help="source of dither standards: gaia=always use the Gaia backup catalog GAIA_STD_FAINT (dense, ~2500-3000/tile); desi=always use main-survey DESI_TARGET STD_FAINT (sparse, ~500/tile); auto=STD_FAINT in-footprint, Gaia off-footprint (pre-2026-09 behaviour) (default=gaia)",
+        help="source of dither standards: gaia=Gaia backup catalog GAIA_STD_FAINT (dense, ~1300-17000/tile); gaia+backup=GAIA_STD_FAINT plus BACKUP_FAINT,BACKUP_VERY_FAINT, which also adds BACKUP to the tile obscon (~4x more stars in sparse fields, but fewer true flux standards); desi=main-survey DESI_TARGET STD_FAINT (sparse, ~500/tile); auto=STD_FAINT in-footprint, Gaia off-footprint (pre-2026-09 behaviour) (default=gaia)",
         type=str,
         default="gaia",
-        choices=["gaia", "desi", "auto"],
+        choices=["gaia", "gaia+backup", "desi", "auto"],
         required=False,
         metavar="STDSOURCE",
     )
