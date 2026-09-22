@@ -2,6 +2,23 @@
 
 Fiber-assignment dithering scripts for DESI survey tiles.
 
+## Environment: pin `desimodules/26.3`
+
+**Do not use `desimodules/main`.** As of 2026-09 it ships numpy 2.5.3, under
+which `desitarget.io.write_mtl` fails on *every* MTL write: it does
+`int(np.unique(release // 1000))`, and converting a size-1 `ndim > 0` array to
+a Python scalar raises `TypeError` from numpy 2.4 on. `write_mtl` catches it
+and re-raises the misleading `"Multiple data releases in MTL ([9])"` — `[9]`
+is a single release. Minimal reproducer:
+`dither_20260921/repro_write_mtl_numpy2.py`.
+
+```bash
+source /global/common/software/desi/desi_environment.sh 26.3   # numpy 2.3.5, works
+```
+
+`fba_main_dither` probes for this at startup and exits 1 with an actionable
+message rather than failing ~800 log lines into the run.
+
 ## Scripts
 
 ### `fba_main_dither`
@@ -29,34 +46,131 @@ For a given tile centre and flavor it:
 
 | `--faflavor` | Program | Target mask | Dithers | σ |
 |---|---|---|---|---|
-| `dithprec` | DARK | `STD_FAINT` / `GAIA_STD_FAINT` | 12 | 0.7″ Gaussian |
-| `dithlost` | DARK | `STD_FAINT` / `GAIA_STD_FAINT` | 2 | 50% Gaussian 2″ + 50% box 10″ |
-| `dithfocus` | DARK | `STD_FAINT` / `GAIA_STD_FAINT` | 12 | 2.0″ Gaussian |
+| `dithprec` | DARK | per `--stdsource` (default `GAIA_STD_FAINT`) | 12 | 0.7″ Gaussian |
+| `dithlost` | DARK | per `--stdsource` (default `GAIA_STD_FAINT`) | 2 | 50% Gaussian 2″ + 50% box 10″ |
+| `dithfocus` | DARK | per `--stdsource` (default `GAIA_STD_FAINT`) | 12 | 2.0″ Gaussian |
 | `scidark` | DARK | `LRG,ELG_LOP,QSO` | 0 | — |
 | `scibright` | BRIGHT | `BGS_BRIGHT,BGS_FAINT` | 0 | — |
 
-## Off-footprint Gaia fallback
+## Where the inputs come from
 
-For dithering flavors (`dithprec`, `dithlost`, `dithfocus`) the script
-selects dither standards in this order:
+Two unrelated "DR" numbers are in play, and confusing them wastes time:
 
-1. **`tile_in_desi == True`** → read from `dr9/{dtver}/targets/main/resolve/dark`,
-   filter on `STD_FAINT` (DESI_TARGET bit 33)
-2. **`tile_in_desi == False`** → read from `gaiadr2/{dtver}/targets/main/resolve/`
-   (`supp` for dtver ≤ 0.x, `backup` for dtver ≥ 1.0), filter on
-   `GAIA_STD_FAINT` (MWS_TARGET bit 33), pass `gaia_stdmask` to fiberassign
-3. **Fallback (tile in footprint but catalog has no coverage)** → if step 1
-   returns 0 targets, automatically fall back to step 2. Sets
-   `tile_in_desi = 0` so fiberassign receives the correct `gaia_stdmask`.
-   This happens when a catalog version covers only a partial footprint
-   
+| input | tree | driven by |
+|---|---|---|
+| dither stars | `gaiadr2/{dtver}/targets/main/resolve/backup` | **hardcoded `"gaiadr2"`** |
+| supp-skies | `gaiadr2/{dtver}/skies-supp` | **hardcoded `"gaiadr2"`** |
+| science targets | `{dr}/{dtver}/targets/main/resolve/{dark,bright}` | `--dr` |
+| skies | `{dr}/{dtver}/skies` | `--dr` |
+| GFAs | `{dr}/{dtver}/gfas` | `--dr` |
+
+`dr9`/`dr11` are **Legacy Surveys imaging** releases; `gaiadr2` is **Gaia's own**
+release. `--dr dr11` moves skies and GFAs and leaves the dither stars untouched —
+there is no `--dr` value that changes them. Only `--dtver` is shared, and it
+indexes the desitarget processing version inside whichever tree, so bumping it
+moves *both* trees at once.
+
+**Do not bump `--dtver` to 2.2.0 for the Gaia catalog.** 2.2.0 is the newest
+`gaiadr2` version that has targets at all (2.9.0+ ship only `skies-supp`), but
+its backup selection is thinner: at 46 +2, `BACKUP_FAINT` drops 4590 → 3268
+(−29%) and `BACKUP_VERY_FAINT` 3691 → 3080, while `GAIA_STD_FAINT` is unchanged
+(1268 → 1269). Same 109 columns either way. Stay on 1.0.0.
+
+## Dither standards: `--stdsource` (added 2026-09-21)
+
+`STD_FAINT` is the main survey's **spectrophotometric calibration** standard
+selection — deliberately sparse (~60/deg², 450–1500 per tile). Using it gave
+designs with only ~300–950 stars on 5000 fibres, the rest sky.
+
+**The CMX analogue is not `GAIA_STD_FAINT`.** CMX's `STD_DITHER`
+(`isSTD_dither_spec`) was only `gaiagmag >= 11.5` and `gaiarmag >= 11.5` with no
+colour cuts and no faint limit — plain Gaia stars. The off-footprint
+`STD_DITHER_GAIA` added `aen < 1`, `astrometric_params_solved == 31` and an
+effective G < 19. So the faithful analogue is `GAIA_STD_FAINT` **plus the
+`BACKUP_*` bits**, which is what `--stdsource gaia+backup` does. `GAIA_STD_FAINT`
+alone is the sparser standards selection — a large improvement over `STD_FAINT`,
+but not a restoration of CMX behaviour.
+
+| `--stdsource` | Masks | Tile obscon | Notes |
+|---|---|---|---|
+| `gaia` (default) | `GAIA_STD_FAINT` | `DARK\|GRAY` | 1268–17238 per tile |
+| `gaia+backup` | `GAIA_STD_FAINT,BACKUP_FAINT,BACKUP_VERY_FAINT` | `DARK\|GRAY\|BACKUP` | ~4× more stars in sparse fields |
+| `desi` | `STD_FAINT` | `DARK\|GRAY` | pre-2026-09 in-footprint behaviour |
+| `auto` | either | `DARK\|GRAY` | `STD_FAINT` in-footprint, Gaia off-footprint (0.0.3) |
+
+### `gaia+backup` does four things, and they must stay coupled
+
+1. selects `GAIA_STD_FAINT,BACKUP_FAINT,BACKUP_VERY_FAINT`
+2. widens the tile obscon to `DARK|GRAY|BACKUP`
+3. applies `AEN < 1` and `params_solved == 31` to the **non-standard** targets
+4. boosts `PRIORITY_INIT` by 200 for `GAIA_STD_FAINT`
+
+They are one option rather than four flags because each is useless or harmful
+alone:
+
+- **Without (2) nothing happens at all.** `BACKUP_*` targets carry
+  `OBSCONDITIONS = 568` = `BACKUP|TWILIGHT12|TWILIGHT18|IGNORE` — no DARK, no
+  GRAY, no BRIGHT. `568 & 3 = 0`, so a `DARK|GRAY` tile drops every one of them.
+  Measured: adding the masks alone moved 46 +2 from 829 to 857 stars.
+- **Adding `BRIGHT` does not help.** `568 & 7 = 0` too. `BACKUP` (bit 8) is the
+  only bit that admits them. CMX used `DARK|GRAY|BRIGHT`, which would also have
+  failed here.
+- **Without (4) you lose 40% of your flux standards** — they fall 833 → 497 as
+  the `BACKUP` stars, six times more numerous, outrank them on the Rp-based
+  priority. The +200 lifts standards clear of the whole Rp range (1000–1110).
+- **(3)** matches the CMX `STD_DITHER_GAIA` astrometric cuts. Standards are
+  exempt so a sparse field cannot lose them to a catalog quirk.
+
+`make_mtl` recomputes `OBSCONDITIONS` from the target bits, so forcing it on the
+target array before the MTL is written is silently discarded. Widening the tile
+obscon is the correct mechanism; both routes give identical results (3225 stars).
+
+### Measured at 46 +2 (the sparsest centre)
+
+| | `gaia` | `gaia+backup` | + astrometric cut |
+|---|---|---|---|
+| candidates | 1268 | 8281 | 7692 |
+| stars on fibres | 833 | 3227 | **3120** |
+| true flux standards | 833 | 833 | **833** |
+| sky / petal | 320–373 | 98–132 | 108–142 |
+| median G | 17.3 | 17.5 | 17.5 |
+| dither σ (req 0.7″) | 0.691/0.695″ | 0.690/0.701″ | 0.701/0.701″ |
+
+The astrometric cut costs 3.3% of the stars. `BACKUP_BRIGHT` is deliberately
+excluded — it reaches G = 10 and saturates in DARK; including it gives 3641.
+
+### Astrometric quality (gaiadr2 2.2.0, 46 +2)
+
+| selection | AEN < 1 | 5-param | no PM | drift > 0.7″ |
+|---|---|---|---|---|
+| `GAIA_STD_FAINT` | 1.000 | 1.000 | 0.000 | 0.000 |
+| `BACKUP_BRIGHT` | 0.968 | 0.992 | 0.008 | 0.033 |
+| `BACKUP_FAINT` | 0.968 | 0.983 | 0.017 | 0.024 |
+| `BACKUP_VERY_FAINT` | 0.906 | 0.976 | 0.024 | 0.015 |
+
+Gaia DR2's epoch is 2015.5, so a 2026 observation is an 11.2-year extrapolation;
+"drift" is `|PM| × Δt`, the position error if proper motion were ignored. The
+script *does* apply it (`update_nowradec`), so this is an upper bound. Note
+`BACKUP_VERY_FAINT` drifts *less* than `BACKUP_BRIGHT` — nearby bright stars move
+fastest, so faintness is not the risk here.
+
+**`GAIA_STD_BRIGHT` is useless** — a strict *subset* of `GAIA_STD_FAINT` (both
+start at G=16; BRIGHT stops at 18, FAINT continues to 19). At 0 +30 they hold
+3111 and 2206 and their union is 3111. Never add the two counts; check overlap.
+
+### Off-footprint / no-coverage fallback
+
+Still present and unchanged: if the selected catalog returns 0 targets, the
+script falls back to the Gaia backup catalog and sets `use_gaia_std = True` so
+fiberassign receives the correct `gaia_stdmask`. With the default
+`--stdsource gaia` this path is rarely reached.
 
 ## Key differences from `fba_cmx_new`
 
 | Aspect | `fba_cmx_new` | `fba_main_dither` |
 |---|---|---|
 | Target mask | `cmx_mask` / `CMX_TARGET` | `desi_mask`, `bgs_mask`, `mws_mask` / `DESI_TARGET`, `BGS_TARGET`, `MWS_TARGET` |
-| Dither std (in-footprint) | `STD_DITHER` | `STD_FAINT` |
+| Dither std | `STD_DITHER` = plain Gaia, G>11.5, no colour cuts | `--stdsource gaia` = `GAIA_STD_FAINT` (standards only); `gaia+backup` = the faithful analogue |
 | Dither std (off-footprint) | `STD_DITHER_GAIA` | `GAIA_STD_FAINT` |
 | Science dark targets | `SV0_LRG,SV0_ELG,SV0_QSO` | `LRG,ELG_LOP,QSO` |
 | Science bright targets | `SV0_BGS,SV0_MWS_FAINT` | `BGS_BRIGHT,BGS_FAINT` |
@@ -71,65 +185,21 @@ selects dither standards in this order:
 | `--dr` default | `dr8` | `dr9` |
 | Off-footprint fallback | not present | auto-falls back when 0 targets found |
 
-## Test commands (validated 2026-04-29)
+## Test commands (validated 2026-09-21)
 
-Off-footprint tile (RA=250 Dec=-5, outside DESI footprint) with dtver 0.49.0:
+Run inside an allocation, not on a login node. Each design (1 reference tile +
+12 dithers) takes ~3-5 min and writes ~300 MB.
+
 ```bash
-source /global/common/software/desi/desi_environment.sh main
-./fba_main_dither --dr dr9 --dtver 0.49.0 --rundate 2026-04-29T10:00:00+00:00 \
-  --seed 80 --tilera 250 --tiledec -5.0 --tileid 84104 \
-  --faflavor dithprec --outdir ./
+salloc --no-shell -A desi -C cpu -q interactive -t 04:00:00 -N 1
+source /global/common/software/desi/desi_environment.sh 26.3
+srun --jobid=<jobid> -n1 -c 32 ./dither_20260921/run_dither_20260921.sh
 ```
 
-Off-footprint tile with dtver 1.0.0 (uses `backup` instead of `supp`):
-```bash
-./fba_main_dither --dr dr9 --dtver 1.0.0 --rundate 2026-04-29T10:00:00+00:00 \
-  --seed 80 --tilera 250 --tiledec -5.0 --tileid 84104 \
-  --faflavor dithprec --outdir ./dtver_1.0.0
-```
+Driver scripts: `dither_20260921/run_dither_20260921.sh` (336 +30) and
+`dither_20260921/run_305m20.sh` (305 -20). Diagnostics used to establish the
+above live alongside them: `density.py`, `bright_check.py`, `backup_check.py`,
+`dr11_check.py`, `cov305.py`, and `verify_design.py <outdir> <reference tileid>`,
+which checks the written products (assignments, EXTRA HDU placement, per-petal
+sky budget, realised dither scatter) rather than trusting the log.
 
-In-footprint tile outside partial catalog coverage (triggers Gaia fallback):
-```bash
-./fba_main_dither --dr dr9 --dtver 1.0.0 --rundate 2026-04-29T10:00:00+00:00 \
-  --seed 80 --tilera 190 --tiledec -25.0 --tileid 84104 \
-  --faflavor dithprec --outdir ./dtver_1.0.0_cmx_fail
-```
-
-## Target-class trade-off: CMX vs main (open question, 2026-09-23)
-
-Choosing between `fba_cmx_new` and `fba_main_dither` is not just a code
-version choice; it changes how many fibers a dither tile can actually use.
-
-The main-survey standards (`STD_FAINT` / `GAIA_STD_FAINT`) are selected as
-*potential spectrophotometric standards*, so they keep only the bluest
-stars. The commissioning classes (`STD_DITHER` / `STD_DITHER_GAIA`) are a
-much looser cut and are far more plentiful.
-
-Densities measured by Adam Myers and David Schlegel near RA, Dec = 46, -2:
-
-| Quantity | Per sq. deg. |
-|---|---|
-| All Gaia sources | ~2900 |
-| Gaia sources with `type == PSF` | ~2600 (90%) |
-| `GAIA_STD_FAINT` | ~150 |
-
-A DESI tile covers ~7.1 sq. deg., so the main-survey selection yields only
-~1000 dither standards per tile while ~20x more Gaia point sources are
-available. Dithers could in principle use any PSF source, so restricting to
-`GAIA_STD_FAINT` leaves most fibers unused.
-
-The counter-argument, and the reason the main-survey path was written in the
-first place, is **footprint**: the CMX targeting files have no coverage at
-some low declinations, where a dither design returns zero targets. The
-main-survey files plus the Gaia backup fallback cover much more sky.
-
-Commissioning target definitions:
-https://desi.lbl.gov/trac/wiki/TargetSelectionWG/CommissioningTargets#STD_DITHER
-
-The dr9/cmx targets are still on disk at NERSC, so `fba_cmx_new` should
-still run, modulo version skew in the desi environment.
-
-**To do:** compare fiber usage from both paths at the same tile centre
-(start at RA, Dec = 46, -2), then make the CMX-vs-main switch a single
-option rather than two separate scripts. Related: the dither scripts also
-need to build from DR11 to reach Dec = -20.
