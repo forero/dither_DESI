@@ -94,3 +94,42 @@ In-footprint tile outside partial catalog coverage (triggers Gaia fallback):
   --seed 80 --tilera 190 --tiledec -25.0 --tileid 84104 \
   --faflavor dithprec --outdir ./dtver_1.0.0_cmx_fail
 ```
+
+## Target-class trade-off: CMX vs main (open question, 2026-09-23)
+
+Choosing between `fba_cmx_new` and `fba_main_dither` is not just a code
+version choice; it changes how many fibers a dither tile can actually use.
+
+The main-survey standards (`STD_FAINT` / `GAIA_STD_FAINT`) are selected as
+*potential spectrophotometric standards*, so they keep only the bluest
+stars. The commissioning classes (`STD_DITHER` / `STD_DITHER_GAIA`) are a
+much looser cut and are far more plentiful.
+
+Densities measured by Adam Myers and David Schlegel near RA, Dec = 46, -2:
+
+| Quantity | Per sq. deg. |
+|---|---|
+| All Gaia sources | ~2900 |
+| Gaia sources with `type == PSF` | ~2600 (90%) |
+| `GAIA_STD_FAINT` | ~150 |
+
+A DESI tile covers ~7.1 sq. deg., so the main-survey selection yields only
+~1000 dither standards per tile while ~20x more Gaia point sources are
+available. Dithers could in principle use any PSF source, so restricting to
+`GAIA_STD_FAINT` leaves most fibers unused.
+
+The counter-argument, and the reason the main-survey path was written in the
+first place, is **footprint**: the CMX targeting files have no coverage at
+some low declinations, where a dither design returns zero targets. The
+main-survey files plus the Gaia backup fallback cover much more sky.
+
+Commissioning target definitions:
+https://desi.lbl.gov/trac/wiki/TargetSelectionWG/CommissioningTargets#STD_DITHER
+
+The dr9/cmx targets are still on disk at NERSC, so `fba_cmx_new` should
+still run, modulo version skew in the desi environment.
+
+**To do:** compare fiber usage from both paths at the same tile centre
+(start at RA, Dec = 46, -2), then make the CMX-vs-main switch a single
+option rather than two separate scripts. Related: the dither scripts also
+need to build from DR11 to reach Dec = -20.
