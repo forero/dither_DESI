@@ -239,6 +239,47 @@ using supp/STD_DITHER_GAIA  (tile_in_desi=1 was not used to decide)
 Under the old logic that tile failed outright. `fba_main_dither` already had an
 equivalent fallback; the two scripts now behave the same way.
 
+## `verify_design.py` — checking a design from its products
+
+```bash
+python dither_20260921/verify_design.py <outdir> <reference tileid>
+python dither_20260921/verify_design.py dither_20260921/designs 84156   # main
+python dither_20260921/verify_design.py auto_test/cmx305        84300   # CMX
+```
+
+Reads the written FITS rather than the log. Per tile: rows, assigned fibres,
+fibres on stars and sky, `EXTRA` HDU presence; then the per-petal sky budget and
+the realised dither scatter. Exits non-zero if anything is wrong.
+
+**It handles both surveys.** Which script wrote the design is read off the
+columns in `FIBERASSIGN` — CMX files carry `CMX_TARGET`, main-survey files carry
+`MWS_TARGET` — and the matching bits are used:
+
+| survey | dither bits | flux-standard bits |
+|---|---|---|
+| main | `GAIA_STD_FAINT`, `BACKUP_FAINT`, `BACKUP_VERY_FAINT` | `GAIA_STD_FAINT` |
+| cmx | `STD_DITHER`, `STD_DITHER_GAIA` | `STD_FAINT` |
+
+For CMX the dither bits are *not* standards — `STD_DITHER` is a plain Gaia
+selection — so the `std` column reports `STD_FAINT` separately and is expected
+to be small.
+
+Two things worth knowing:
+
+- **One directory can hold several designs.** The tool takes only the block
+  belonging to the reference tileid, walking forward while tiles have an `EXTRA`
+  HDU; the first tile without one is the next design's reference.
+- **Scatter is measured on assigned non-sky fibres only.** Sky keeps
+  `UNDITHER == TARGET`, so including it drags the measured sigma below the
+  requested one (0.62″ instead of 0.70″ in an early version of this tool).
+
+### Accepted, not a failure: the CMX sky budget
+
+CMX designs read `dr9/0.49.0` skies, which are far sparser than `1.0.0`: 6–18
+sky fibres per petal at 80 −40 and **0** at 305 −20, against the 40 requested by
+`--nskypet`. This is a known and accepted limitation of the CMX path — the tool
+prints it under NOTES and still passes.
+
 ## Sky coverage: where each path works
 
 `skymap/dither_coverage.png`, built by `skymap/sweep.py` (per-healpix density
@@ -290,9 +331,6 @@ in numpy 2.3.5 and is gone in 2.5.3, so the same pin covers both scripts.
 fibres per petal against the 40 requested, because `dr9/0.49.0` skies are much
 sparser than `dr9/1.0.0`. The main path at 46 −2 got 100–153.
 
-`verify_design.py` cannot check a CMX design: it counts
-`MWS_TARGET & GAIA_STD_FAINT`, which CMX files do not have (they use
-`CMX_TARGET`), so it reports 0 standards and a `nan` dither scatter.
 
 ## Key differences from `fba_cmx_new`
 
@@ -328,7 +366,6 @@ srun --jobid=<jobid> -n1 -c 32 ./dither_20260921/run_dither_20260921.sh
 Driver scripts: `dither_20260921/run_dither_20260921.sh` (336 +30) and
 `dither_20260921/run_305m20.sh` (305 -20). Diagnostics used to establish the
 above live alongside them: `density.py`, `bright_check.py`, `backup_check.py`,
-`dr11_check.py`, `cov305.py`, and `verify_design.py <outdir> <reference tileid>`,
-which checks the written products (assignments, EXTRA HDU placement, per-petal
-sky budget, realised dither scatter) rather than trusting the log.
+`dr11_check.py`, `cov305.py`, and `verify_design.py` (see its own section
+above -- it handles both the CMX and the main survey designs).
 
