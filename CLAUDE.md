@@ -165,11 +165,14 @@ script falls back to the Gaia backup catalog and sets `use_gaia_std = True` so
 fiberassign receives the correct `gaia_stdmask`. With the default
 `--stdsource gaia` this path is rarely reached.
 
-## `fba_dither_auto` — picking the path automatically (added 2026-09-23)
+## `fba_dither_auto` — one self-contained script (added 2026-09-23)
 
-Neither script works everywhere, so `fba_dither_auto` probes the tile centre and
-execs whichever one suits it. Call it **without** `--dr`, `--dtver` or
-`--stdsource`:
+A standalone dither script that picks its own catalogs. Derived from
+`fba_main_dither` with the CMX catalogs folded in; it shells out to nothing.
+Dither flavors only — `dithprec`, `dithlost`, `dithfocus`. Science tiles stay in
+`fba_main_dither`.
+
+Call it **without** `--dtver` or `--stdsource` (it has neither):
 
 ```bash
 ./fba_dither_auto --tilera 46 --tiledec -2 --tileid 84182 \
@@ -177,44 +180,73 @@ execs whichever one suits it. Call it **without** `--dr`, `--dtver` or
   --seed 80 --outdir ./designs/
 ```
 
-`--dry-run` reports the decision without running (~20 s).
-`--force {main,cmx}` skips the probe. `--min-targets` moves the bar.
+`--dry-run` reports the decision and exits (~5 s, light enough for a login
+node). `--force {main,cmx}` skips the probe. `--min-targets` moves the bar.
 
 ### The rule — two paths, threshold on main only
 
 ```
-main (--stdsource gaia, GAIA_STD_FAINT)   if it has >= --min-targets
-cmx  (STD_DITHER / STD_DITHER_GAIA)       otherwise
+main  GAIA_STD_FAINT, gaiadr2/1.0.0 backup      if >= --min-targets
+cmx   STD_DITHER (dr9/0.49.0 cmx no-obscon), or
+      STD_DITHER_GAIA (gaiadr2/0.49.0 cmx supp) otherwise
 ```
 
-The threshold is a question about the **main path only**: can the main-survey
-catalog fill this focal plane? If yes, prefer it — its catalogs are current and
-every assigned star is a flux standard. If no, fall to CMX, which is ~10×
-denser everywhere but frozen at 2020 and yields almost no standards.
+The threshold asks about the **main path only**: can the main-survey catalog
+fill this focal plane? If yes, prefer it — current catalogs, and every assigned
+star is a flux standard. If no, fall to CMX: ~10× denser everywhere, but frozen
+at 2020 and yielding almost no standards (127 vs 833 at 46 +2).
 
-`--min-targets` defaults to **9000**, roughly where a design saturates the 4354
-assignable fibres.
+Default **9000**, roughly where a design saturates the 4354 assignable fibres.
+It is a preference, not a maximum: CMX is denser at 336 +30 (61103 vs 9146) and
+is still not chosen.
 
-This is a **preference, not a maximum**: CMX is denser nearly everywhere
-(61103 vs 9146 at 336 +30) and is still not chosen there. `--stdsource
-gaia+backup` is deliberately *not* a rung — the dispatcher chooses between main
-and CMX only.
+**Neither choice is gated on the DESI footprint.** Both the main/CMX decision
+and the CMX no-obscon/supp decision come from probing the catalogs. `tile_in_desi`
+is still computed for the grz plotting branch but decides nothing.
 
-### Measured decisions (threshold 9000)
+The probe short-circuits: if main clears the bar the CMX catalogs are never
+read, which is the slow part (6 s vs 15 s at 336 +30).
 
-| centre | main `GAIA_STD_FAINT` | CMX `STD_DITHER` | chosen |
-|---|---|---|---|
-| 336 +30 | 9146 | 61103 | main |
-| 0 +30 | 3111 | 31850 | CMX |
-| 46 +2 | 1268 | 13422 | CMX |
-| 305 −20 | 17238 | 0 (supp: 70745) | main |
-| 80 −40 | **0** | 30554 | CMX |
+### Measured decisions
 
-Verified end to end on both branches: 46 −2 gave 3032 stars / 857 standards via
-the main path, 80 −40 gave 4121 stars via `fba_cmx_new`, 13 tiles each.
+| centre | main | cmx | cmx supp | chosen |
+|---|---|---|---|---|
+| 336 +30 | 9146 | 61103 | 54657 | main |
+| 46 +2 | 1268 | 13422 | 12566 | cmx / no-obscon |
+| 46 −2 | 1206 | 12858 | 11671 | cmx / no-obscon |
+| 305 −20 | 17238 | **0** | 70745 | main |
+| 80 −40 | **0** | 30554 | 25823 | cmx / no-obscon |
 
-The dispatcher runs `os.makedirs` on `--outdir` before exec'ing, because both
-underlying scripts call a bare `os.mkdir` that dies on a nested path.
+### It reproduces both originals exactly
+
+Same centre, seed and rundate:
+
+| path | `fba_dither_auto` | original |
+|---|---|---|
+| CMX, 46 +2 | 3869 / 3742 / 127 / 450 | `fba_cmx_new`: 3869 / 3742 / 127 / 450 |
+| main, 336 +30 | 3439 / 3439 / 394 | `fba_main_dither`: 3439 / 3439 / 394 |
+
+(science / science-not-standard / standard / sky)
+
+### Notes on the merge
+
+The dithering machinery is byte-identical between the two original scripts —
+only an empty-input guard in `update_nowradec` and two comments differ — so what
+the merge carries is configuration, not logic: catalog dirs, `dtver`, target
+bits, `survey=` string, tile obscon (`DARK|GRAY|BRIGHT` on the CMX path), the
+`--gaia_stdmask` value, and the `main_cmx_or_sv` monkey patch, which is applied
+only on the CMX path.
+
+A module-level `SURVEY` flag, set once from the chosen path, tells
+`target_mask_filter` which mask scheme to use. It is deliberately **not**
+inferred from the data: the function is called with structured arrays in most
+places and with a plain dict in the plotting block, so `.dtype` is not always
+available. Some bit names (`STD_FAINT`) exist in both schemes, so guessing would
+be wrong as well as fragile.
+
+At ~1700 lines it is large, and that is inherited: `doplot` is 355 lines and
+`dofa` 289, with ~244 more in helpers duplicated across all three scripts.
+Kept self-contained on purpose — no shared module.
 
 ## `fba_cmx_new` no longer gates on the DESI footprint (changed 2026-09-23)
 
