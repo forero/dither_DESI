@@ -44,7 +44,7 @@ import fitsio
 from desitarget.io import read_targets_in_tiles, write_targets, write_mtl
 from desitarget.targetmask import desi_mask, bgs_mask, mws_mask, obsconditions
 from desitarget.cmx.cmx_targetmask import cmx_mask
-from desitarget.targets import set_obsconditions
+from desitarget.targets import set_obsconditions, encode_targetid
 from desimodel.footprint import is_point_in_desi
 import desimodel.io as dmio
 from fiberassign.scripts.assign import parse_assign, run_assign_bytile, run_assign_full
@@ -455,23 +455,30 @@ def main():
         log.error("code needs to be run either on NERSC/cori, NERSC/perlmutter or KPNO/desi; exiting")
         sys.exit()
 
-    # AR safe: environment.  desitarget.io.write_mtl does int() on a size-1,
-    # AR ndim-1 array (np.unique(release // 1000)).  numpy deprecated that in
-    # AR 1.25 and raises TypeError from 2.4 on, which write_mtl catches and
-    # AR re-raises as the misleading "Multiple data releases in MTL ([9])" --
-    # AR [9] being a single release.  Probe the exact failing expression rather
-    # AR than sniffing versions, and fail here with something actionable
-    # AR instead of a traceback 800 lines into the run.
+    # safe: environment.  desimodules/main ships a numpy under which
+    # desitarget.io.write_mtl raises on every write, and reports it as
+    # "Multiple data releases in MTL", which points at the target catalog
+    # rather than at the environment.
+    #
+    # Make the real call rather than probing numpy.  The numpy behaviour is
+    # only a proxy for this: desitarget could fix its int(dr) line while numpy
+    # keeps raising, and the proxy would then refuse a working environment.
+    # nowrite=True runs the same code path and touches no disk.
+    _probe = np.zeros(1, dtype=mtldatamodel.dtype)
+    _probe["TARGETID"] = encode_targetid(objid=1, brickid=1, release=9000)
+    _probe["OBSCONDITIONS"] = 1
+    _probe["NUMOBS_MORE"] = 1
     try:
-        _ = int(np.unique(np.array([9000]) // 1000))
-    except TypeError:
+        with tempfile.TemporaryDirectory() as _tmp:
+            write_mtl(_tmp, _probe, survey="main", ecsv=False, nowrite=True)
+    except Exception as _e:
         log.error(
-            "this numpy ({}) breaks desitarget.io.write_mtl; the run would fail later "
-            "with the misleading 'Multiple data releases in MTL'.  Use the pinned "
-            "environment:  source /global/common/software/desi/desi_environment.sh 26.3 "
-            "; exiting".format(np.__version__)
-        )
-        sys.exit(1)  # AR nonzero so driver scripts running under `set -e` stop here
+            "this environment cannot write an MTL: write_mtl raised {}: {}. "
+            "Any 'Multiple data releases' message above is misleading -- there "
+            "is a single release here.  Use the pinned environment:  source "
+            "/global/common/software/desi/desi_environment.sh 26.3 ; exiting".format(
+                type(_e).__name__, _e))
+        sys.exit(1)  # nonzero so driver scripts running under `set -e` stop here
 
     # AR is tile in the desi footprint?
     # AR -> if not, special msk and targdir for dithering
