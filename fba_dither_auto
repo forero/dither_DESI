@@ -1,0 +1,184 @@
+#!/usr/bin/env python
+"""Pick the CMX or the main dither path automatically, from target density.
+
+The two dither scripts need different catalogs, and which one works depends on
+where the tile is:
+
+  * `GAIA_STD_FAINT` (main survey, gaiadr2/1.0.0 backup) stops dead at
+    Dec = -30 -- the DESI footprint's southern limit -- and thins out in the
+    Galactic plane and around the Magellanic Clouds.
+  * `STD_DITHER` / `STD_DITHER_GAIA` (CMX, dr9/0.49.0 + gaiadr2/0.49.0) cover
+    the whole sky and are ~10x denser, but come from frozen 2020-era catalogs
+    and yield far fewer true flux standards (127 vs 833 at RA=46 Dec=+2).
+
+So this probes the tile centre and picks between exactly two paths:
+
+  main (--stdsource gaia, GAIA_STD_FAINT)   if it has >= --min-targets
+  cmx  (STD_DITHER, or STD_DITHER_GAIA off-footprint)   otherwise
+
+The threshold applies to the main path only: it is the question "can the main
+survey catalog fill this focal plane?".  If yes, use it -- its catalogs are
+current and every assigned star is a flux standard.  If no, fall to CMX, which
+is ~10x denser everywhere but frozen at 2020 and yields almost no standards.
+
+--min-targets defaults to 9000, roughly where a design saturates the 4354
+assignable fibres.
+
+Usage is the same as fba_main_dither minus --dr, --dtver and --stdsource:
+
+  ./fba_dither_auto --tilera 46 --tiledec 2 --tileid 84200 \
+      --faflavor dithprec --rundate 2026-09-23T10:00:00+00:00 \
+      --seed 80 --outdir ./designs/
+
+  ./fba_dither_auto ... --dry-run     # report the decision, run nothing
+"""
+import argparse
+import os
+import subprocess
+import sys
+
+import numpy as np
+from astropy.table import Table
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# AR catalog versions each path is pinned to.  CMX targets exist only at
+# AR dr9/0.47.0 and 0.49.0; the main Gaia backup is thinner at 2.2.0, so 1.0.0.
+MAIN_DR, MAIN_DTVER = "dr9", "1.0.0"
+CMX_DR, CMX_DTVER = "dr9", "0.49.0"
+
+DITHER_FLAVORS = ("dithprec", "dithlost", "dithfocus")
+
+
+def count_targets(path, col, maskobj, bits, ra, dec):
+    """Number of targets at this tile centre passing any of `bits`."""
+    from desitarget.io import read_targets_in_tiles
+
+    if not os.path.isdir(path):
+        return -1
+    t = Table({"TILEID": [1], "RA": [float(ra)], "DEC": [float(dec)],
+               "OBSCONDITIONS": [3], "IN_DESI": [1], "PROGRAM": ["DARK"]})
+    try:
+        d = read_targets_in_tiles(path, tiles=t, quick=True)
+    except Exception:
+        return -1
+    if len(d) == 0:
+        return 0
+    keep = np.zeros(len(d), dtype=bool)
+    for b in bits:
+        if b in maskobj.names():
+            keep |= (d[col] & maskobj[b]) > 0
+    return int(keep.sum())
+
+
+def probe(ra, dec):
+    """Candidate counts for each rung of the ladder."""
+    from desitarget.targetmask import mws_mask
+    from desitarget.cmx.cmx_targetmask import cmx_mask
+
+    cats = os.path.join(os.getenv("DESI_TARGET"), "catalogs")
+    main_dir = os.path.join(cats, "gaiadr2", MAIN_DTVER, "targets/main/resolve/backup")
+    cmx_dir = os.path.join(cats, CMX_DR, CMX_DTVER, "targets/cmx/resolve/no-obscon")
+    cmx_supp = os.path.join(cats, "gaiadr2", CMX_DTVER, "targets/cmx/resolve/supp")
+
+    n = {}
+    n["main_gaia"] = count_targets(main_dir, "MWS_TARGET", mws_mask,
+                                   ["GAIA_STD_FAINT"], ra, dec)
+    n["cmx"] = count_targets(cmx_dir, "CMX_TARGET", cmx_mask, ["STD_DITHER"], ra, dec)
+    # AR fba_cmx_new reaches for the supp file when the tile is off-footprint
+    n["cmx_supp"] = count_targets(cmx_supp, "CMX_TARGET", cmx_mask,
+                                  ["STD_DITHER_GAIA"], ra, dec)
+    n["cmx_any"] = max(n["cmx"], n["cmx_supp"])
+    return n
+
+
+def decide(n, min_targets):
+    """Return (script, extra args, label, candidate count).
+
+    The threshold is a question about the main path only: can it fill the focal
+    plane?  If not, CMX is the answer regardless of how the two compare.
+    """
+    if n["main_gaia"] >= min_targets:
+        return ("fba_main_dither", ["--stdsource", "gaia"],
+                "main / GAIA_STD_FAINT", n["main_gaia"])
+    if n["cmx_any"] > 0:
+        return ("fba_cmx_new", [], "CMX / STD_DITHER", n["cmx_any"])
+    if n["main_gaia"] > 0:
+        return ("fba_main_dither", ["--stdsource", "gaia"],
+                "main / GAIA_STD_FAINT (below threshold, no CMX coverage)",
+                n["main_gaia"])
+    return (None, None, "no targets in any catalog", 0)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Run the dither script best suited to the tile centre.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--tilera", type=float, required=True)
+    p.add_argument("--tiledec", type=float, required=True)
+    p.add_argument("--tileid", type=int, required=True,
+                   help="first tileid; the design uses tileid .. tileid+ndither")
+    p.add_argument("--faflavor", type=str, default="dithprec",
+                   choices=list(DITHER_FLAVORS))
+    p.add_argument("--outdir", type=str, required=True)
+    p.add_argument("--rundate", type=str, default=None)
+    p.add_argument("--seed", type=int, default=80)
+    p.add_argument("--pmtime", type=str, default=None)
+    p.add_argument("--min-targets", dest="min_targets", type=int, default=9000,
+                   help="candidates needed to accept a rung of the ladder; the "
+                        "default is about where the 4354 assignable fibres saturate")
+    p.add_argument("--force", type=str, default=None,
+                   choices=["main", "cmx"],
+                   help="skip the probe and use this path")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true",
+                   help="report the decision and exit without running")
+    args = p.parse_args()
+
+    if os.getenv("DESI_TARGET") is None:
+        sys.exit("DESI_TARGET is not set; source "
+                 "/global/common/software/desi/desi_environment.sh 26.3 first")
+
+    if args.force is not None:
+        n = {"main_gaia": -1, "cmx": -1, "cmx_supp": -1, "cmx_any": -1}
+        script, extra, rung, ncand = {
+            "main": ("fba_main_dither", ["--stdsource", "gaia"], "main / GAIA_STD_FAINT", -1),
+            "cmx":  ("fba_cmx_new", [], "CMX / STD_DITHER", -1),
+        }[args.force]
+        print("forced: %s" % rung)
+    else:
+        print("probing RA=%g Dec=%+g ..." % (args.tilera, args.tiledec), flush=True)
+        n = probe(args.tilera, args.tiledec)
+        print("  main  GAIA_STD_FAINT          : %7d   (threshold %d)"
+              % (n["main_gaia"], args.min_targets))
+        print("  cmx   STD_DITHER              : %7d" % n["cmx"])
+        print("  cmx   STD_DITHER_GAIA (supp)  : %7d" % n["cmx_supp"])
+        script, extra, rung, ncand = decide(n, args.min_targets)
+        if script is None:
+            sys.exit("no dither targets at this centre in any catalog; giving up")
+        print("\ndecision: %s  (%d candidates)" % (rung, ncand))
+        print("script:   %s" % script)
+
+    dr, dtver = ((CMX_DR, CMX_DTVER) if script == "fba_cmx_new"
+                 else (MAIN_DR, MAIN_DTVER))
+    cmd = [os.path.join(HERE, script),
+           "--dr", dr, "--dtver", dtver,
+           "--tilera", repr(args.tilera), "--tiledec", repr(args.tiledec),
+           "--tileid", str(args.tileid), "--faflavor", args.faflavor,
+           "--seed", str(args.seed), "--outdir", args.outdir] + extra
+    if args.rundate is not None:
+        cmd += ["--rundate", args.rundate]
+    if args.pmtime is not None:
+        cmd += ["--pmtime", args.pmtime]
+
+    print("\n" + " ".join(cmd))
+    if args.dry_run:
+        print("\n--dry-run: not executing")
+        return 0
+    # AR both scripts do a bare os.mkdir on --outdir, which fails on a nested
+    # AR path whose parent does not exist yet.  Create it here instead.
+    os.makedirs(args.outdir, exist_ok=True)
+    return subprocess.call(cmd)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

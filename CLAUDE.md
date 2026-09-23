@@ -165,6 +165,135 @@ script falls back to the Gaia backup catalog and sets `use_gaia_std = True` so
 fiberassign receives the correct `gaia_stdmask`. With the default
 `--stdsource gaia` this path is rarely reached.
 
+## `fba_dither_auto` — picking the path automatically (added 2026-09-23)
+
+Neither script works everywhere, so `fba_dither_auto` probes the tile centre and
+execs whichever one suits it. Call it **without** `--dr`, `--dtver` or
+`--stdsource`:
+
+```bash
+./fba_dither_auto --tilera 46 --tiledec -2 --tileid 84182 \
+  --faflavor dithprec --rundate 2026-09-23T10:00:00+00:00 \
+  --seed 80 --outdir ./designs/
+```
+
+`--dry-run` reports the decision without running (~20 s).
+`--force {main,cmx}` skips the probe. `--min-targets` moves the bar.
+
+### The rule — two paths, threshold on main only
+
+```
+main (--stdsource gaia, GAIA_STD_FAINT)   if it has >= --min-targets
+cmx  (STD_DITHER / STD_DITHER_GAIA)       otherwise
+```
+
+The threshold is a question about the **main path only**: can the main-survey
+catalog fill this focal plane? If yes, prefer it — its catalogs are current and
+every assigned star is a flux standard. If no, fall to CMX, which is ~10×
+denser everywhere but frozen at 2020 and yields almost no standards.
+
+`--min-targets` defaults to **9000**, roughly where a design saturates the 4354
+assignable fibres.
+
+This is a **preference, not a maximum**: CMX is denser nearly everywhere
+(61103 vs 9146 at 336 +30) and is still not chosen there. `--stdsource
+gaia+backup` is deliberately *not* a rung — the dispatcher chooses between main
+and CMX only.
+
+### Measured decisions (threshold 9000)
+
+| centre | main `GAIA_STD_FAINT` | CMX `STD_DITHER` | chosen |
+|---|---|---|---|
+| 336 +30 | 9146 | 61103 | main |
+| 0 +30 | 3111 | 31850 | CMX |
+| 46 +2 | 1268 | 13422 | CMX |
+| 305 −20 | 17238 | 0 (supp: 70745) | main |
+| 80 −40 | **0** | 30554 | CMX |
+
+Verified end to end on both branches: 46 −2 gave 3032 stars / 857 standards via
+the main path, 80 −40 gave 4121 stars via `fba_cmx_new`, 13 tiles each.
+
+The dispatcher runs `os.makedirs` on `--outdir` before exec'ing, because both
+underlying scripts call a bare `os.mkdir` that dies on a nested path.
+
+## `fba_cmx_new` no longer gates on the DESI footprint (changed 2026-09-23)
+
+It used to choose its target catalog purely from `is_point_in_desi()`:
+in-footprint → `no-obscon`, out → `supp`, with **no fallback**. That is the wrong
+question. A tile can sit inside the footprint and still have no `STD_DITHER`
+coverage, and the script would then read an empty catalog and die.
+
+It now probes both catalogs at the tile centre and uses whichever has more
+targets. `tile_in_desi` is still computed (the plotting branch needs it) but no
+longer decides anything.
+
+Worked example — RA 305, Dec −20:
+
+```
+probe no-obscon:     0  STD_DITHER
+probe supp:      70745  STD_DITHER_GAIA
+using supp/STD_DITHER_GAIA  (tile_in_desi=1 was not used to decide)
+-> 4348 stars assigned
+```
+
+Under the old logic that tile failed outright. `fba_main_dither` already had an
+equivalent fallback; the two scripts now behave the same way.
+
+## Sky coverage: where each path works
+
+`skymap/dither_coverage.png`, built by `skymap/sweep.py` (per-healpix density
+over 1827 catalog files, cached to `skymap/density_nside32.npz`) and
+`skymap/plot_coverage.py`.
+
+**`GAIA_STD_FAINT` stops dead at Dec = −30** — the DESI footprint's southern
+limit. Not thinning: zero.
+
+| Dec band | CMX usable | main usable |
+|---|---|---|
+| −90 to −60 | 100% | **0%** |
+| −60 to −40 | 100% | **0%** |
+| −40 to −30 | 97% | 11% |
+| −35 to −25 | 97% | 52% |
+| −30 to −20 | 98% | 95% |
+| 0 to +20 | 100% | 99% |
+
+At ≥1000 targets per tile: 73% of sky either works, **27% CMX-only** (almost all
+the southern cap, plus the Galactic plane and the Magellanic Clouds), 0% main-only.
+So below Dec −30 the CMX path is not a preference, it is the only option.
+
+## CMX vs main at the same centre (RA 46, Dec +2)
+
+The comparison Schlegel and Myers asked for. Same tile, same rundate:
+
+| path | candidates | fibres | on stars | on sky | unassigned |
+|---|---|---|---|---|---|
+| CMX `STD_DITHER` | 13422 | 5000 | **3869** | 485 | 646 |
+| main `--stdsource gaia` | 1268 | 5000 | **833** | 3521 | 646 |
+| main `--stdsource gaia+backup` | 8281 | 5000 | 3120 | 1234 | 646 |
+
+The **646 unassigned is identical** in all three — a positioner floor, not a
+target-supply problem. No selection change touches it.
+
+Their density figures check out: `GAIA_STD_FAINT` ≈ 158/deg², `STD_DITHER`
+≈ 1680/deg².
+
+**CMX buys stars by giving up standards**: it assigns only 127 true flux
+standards against 833 for `gaia+backup`. That trade is the reason the ladder
+prefers main while main can still fill the plane.
+
+CMX catalogs live at `dr9/0.47.0` and `dr9/0.49.0` (`targets/cmx/resolve/no-obscon`)
+with `gaiadr2/0.49.0/targets/cmx/resolve/supp` for off-footprint. `fba_cmx_new`
+runs unmodified under `desimodules/26.3` — it still uses `np.in1d`, which exists
+in numpy 2.3.5 and is gone in 2.5.3, so the same pin covers both scripts.
+
+**Watch the sky budget on the CMX path.** At 80 −40 the design got only 6–18 sky
+fibres per petal against the 40 requested, because `dr9/0.49.0` skies are much
+sparser than `dr9/1.0.0`. The main path at 46 −2 got 100–153.
+
+`verify_design.py` cannot check a CMX design: it counts
+`MWS_TARGET & GAIA_STD_FAINT`, which CMX files do not have (they use
+`CMX_TARGET`), so it reports 0 standards and a `nan` dither scatter.
+
 ## Key differences from `fba_cmx_new`
 
 | Aspect | `fba_cmx_new` | `fba_main_dither` |

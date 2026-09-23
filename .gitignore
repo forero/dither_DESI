@@ -1,0 +1,12 @@
+# AR fiberassign products: large binaries, these belong on $PSCRATCH and in SVN,
+# AR not in git.  The repo tracks scripts and docs only.
+*.fits
+*.fits.gz
+*.log
+*.png
+*~
+.ipynb_checkpoints/
+dither_20260921/designs/
+auto_test/
+cmx_vs_main/
+skymap/*.npz

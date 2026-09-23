@@ -455,9 +455,53 @@ def main():
         "bwidth"
     ] = 0.0  # AR box width [arcsec] of the dithering for the dithlost-in-space case
 
+    # AR directories (already checked for desi or cori or perlmutter only)
+    hostname = os.getenv("HOSTNAME")
+    if "desi" in hostname:
+        path_to_targets = "/data/target/catalogs"
+        path_to_svn_tiles = "/data/tiles/SVN_tiles"
+    if "cori" in hostname or "perlmutter" in os.getenv("NERSC_HOST"):
+        path_to_targets = os.path.join(os.getenv("DESI_TARGET"), "catalogs")
+        path_to_svn_tiles = os.path.join(
+            os.getenv("DESI_TARGET"), "fiberassign/tiles/trunk"
+        )
+
+    # AR Which CMX target catalog actually has dither stars here?
+    # AR The footprint test is not the question we care about: a tile can sit
+    # AR inside the DESI footprint and still have no STD_DITHER coverage (e.g.
+    # AR RA=305 Dec=-20, where no-obscon holds 0).  So go and look, and use
+    # AR whichever catalog has more targets at this centre.
+    use_gaia_cmx = False
+    if args.faflavor in ["dithprec", "dithlost", "dithfocus"]:
+        _t = Table()
+        _t["TILEID"], _t["RA"], _t["DEC"] = [0], [args.tilera], [args.tiledec]
+        _t["OBSCONDITIONS"], _t["IN_DESI"] = [3], [1]
+        _n = {}
+        for _key, _dir, _msk in [
+            ("no-obscon", os.path.join(path_to_targets, args.dr, args.dtver,
+                                       "targets/cmx/resolve/no-obscon"), "STD_DITHER"),
+            ("supp", os.path.join(path_to_targets, "gaiadr2", args.dtver,
+                                  "targets/cmx/resolve/supp"), "STD_DITHER_GAIA"),
+        ]:
+            try:
+                _d = read_targets_in_tiles(_dir, tiles=_t, quick=True)
+                _n[_key] = int(((_d["CMX_TARGET"] & cmx_mask[_msk]) > 0).sum())
+            except Exception:
+                _n[_key] = 0
+            log.info("{:.1f}s\tprobe {}: {} {} targets".format(
+                time() - start, _key, _n[_key], _msk))
+        use_gaia_cmx = _n["supp"] > _n["no-obscon"]
+        log.info("{:.1f}s\tusing {} (tile_in_desi={} was not used to decide)".format(
+            time() - start, "supp/STD_DITHER_GAIA" if use_gaia_cmx
+            else "no-obscon/STD_DITHER", int(tile_in_desi)))
+        if max(_n.values()) == 0:
+            log.error("{:.1f}s\tno CMX dither targets at this centre; exiting".format(
+                time() - start))
+            sys.exit(1)
+
     # AR flavor settings
     if args.faflavor == "dithprec":
-        if tile_in_desi == 0:
+        if use_gaia_cmx:
             fdict["msks"] = "STD_DITHER_GAIA"
         else:
             fdict["msks"] = "STD_DITHER"
@@ -466,7 +510,7 @@ def main():
         fdict["gfrac"] = 1.0
         fdict["gwidth"] = 0.7
     elif args.faflavor == "dithlost":
-        if tile_in_desi == 0:
+        if use_gaia_cmx:
             fdict["msks"] = "STD_DITHER_GAIA"
         else:
             fdict["msks"] = "STD_DITHER"
@@ -486,7 +530,7 @@ def main():
         # fdict['msks'] = 'SV0_WD,MINI_SV_BGS_BRIGHT,SV0_MWS_FAINT'
         fdict["msks"] = "SV0_WD,SV0_BGS,SV0_MWS_FAINT"
     elif args.faflavor == "dithfocus":
-        if tile_in_desi == 0:
+        if use_gaia_cmx:
             fdict["msks"] = "STD_DITHER_GAIA"
         else:
             fdict["msks"] = "STD_DITHER"
@@ -497,19 +541,8 @@ def main():
     if fdict["seed"] != -1:
         np.random.seed(fdict["seed"])
 
-    # AR directories (already checked for desi or cori or perlmutter only)
-    hostname = os.getenv("HOSTNAME")
-    if "desi" in hostname:
-        path_to_targets = "/data/target/catalogs"
-        path_to_svn_tiles = "/data/tiles/SVN_tiles"
-    if "cori" in hostname or "perlmutter" in os.getenv("NERSC_HOST"):
-        path_to_targets = os.path.join(os.getenv("DESI_TARGET"), "catalogs")
-        path_to_svn_tiles = os.path.join(
-            os.getenv("DESI_TARGET"), "fiberassign/tiles/trunk"
-        )
-
     mydirs = {}
-    if (args.faflavor in ["dithprec", "dithlost", "dithfocus"]) & (tile_in_desi == 0):
+    if use_gaia_cmx:
         mydirs["targ"] = os.path.join(
             path_to_targets, "gaiadr2", args.dtver, "targets/cmx/resolve/supp"
         )
@@ -1147,7 +1180,7 @@ def main():
             for ip, key in enumerate(["FLUX_G", "FLUX_R", "FLUX_Z"]):
                 ax = plt.subplot(gs[0, ip])
                 # AR handling outside desi cases
-                if tile_in_desi == 1:
+                if (tile_in_desi == 1) and (not use_gaia_cmx):
                     keep = dp[key] > 0
                     xp = 22.5 - 2.5 * np.log10(dp[key][keep])
                     bitp = dp["CMX_TARGET"][keep]
